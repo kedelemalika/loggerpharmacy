@@ -91,11 +91,34 @@ Sumber: `platformio.ini`.
 
 Tidak ada `default_envs`, jadi tidak ada env yang aktif-by-default.
 
+## Classification Legend
+
+- `Tested`: sudah diuji pada perangkat nyata.
+- `Recommended`: direkomendasikan untuk deployment saat ini.
+- `Experimental`: untuk eksperimen/validasi compile path.
+- `Diagnostic`: untuk uji diagnosis (mis. disable MQTT/extflash).
+
+## Environment Classification
+
+| Environment | Tested | Recommended | Experimental | Diagnostic | Catatan |
+|---|---|---|---|---|---|
+| `esp32-s2-saola-1-htu21-extflash-nocompact` | Yes | Yes | No | No | **Paling stabil saat ini**, sudah dipakai pengujian nyata, production candidate |
+| `esp32dev` | No | No | No | No | Stable build path ESP32 + SHT20 |
+| `esp32-s2-saola-1` | No | No | No | No | Stable build path ESP32-S2 + AHT10 |
+| `esp32-s2-saola-1-htu21` | No | No | No | No | Stable build path ESP32-S2 + HTU21 |
+| `esp32-c3-devkitm-1` | No | No | No | No | Provisional pin mapping |
+| `esp32-s2-saola-1-htu21-noextflash` | No | No | No | No | Runtime tanpa external flash |
+| `test_strict_dual_sensor` | No | No | Yes | No | Negative test (expected fail) |
+| `test_experimental_dual_sensor` | No | No | Yes | No | Negative test (expected fail) |
+| `test_experimental_invalid_combo` | No | No | Yes | No | ALLOW_EXPERIMENTAL combo check bypass |
+| `test_experimental_htu21_on_esp32` | No | No | Yes | No | Compile-only HTU21 path |
+| `esp32-s2-saola-1-htu21-diag-nomqtt` | No | No | No | Yes | Diagnostic mode tanpa MQTT |
+| `esp32-s2-saola-1-htu21-diag-nomqtt-noextflash` | No | No | No | Yes | Diagnostic tanpa MQTT + extflash |
+| `esp32-s2-saola-1-htu21-diag-nomqtt-extflash-nocompact` | No | No | No | Yes | Diagnostic tanpa MQTT + no compact |
+
 ## Recommended
 
-- `esp32dev` (STRICT, ESP32 + SHT20)
-- `esp32-s2-saola-1` (STRICT, ESP32-S2 + AHT10)
-- `esp32-s2-saola-1-htu21` (STRICT, ESP32-S2 + HTU21)
+- `esp32-s2-saola-1-htu21-extflash-nocompact` (STRICT, ESP32-S2 + HTU21 + external flash, tested real device)
 
 ## Active (runtime/operasional, non-test)
 
@@ -105,6 +128,22 @@ Tidak ada `default_envs`, jadi tidak ada env yang aktif-by-default.
 - `esp32-s2-saola-1-htu21`
 - `esp32-s2-saola-1-htu21-noextflash`
 - `esp32-s2-saola-1-htu21-extflash-nocompact`
+
+## Recommended Production Environment
+
+- Environment name: `esp32-s2-saola-1-htu21-extflash-nocompact`
+- Status: `Tested`
+- Hardware:
+  - ESP32-S2 Saola-1
+  - HTU21
+  - External Flash
+- Current deployment status:
+  - Sudah digunakan untuk pengujian nyata pada perangkat fisik.
+  - Menjadi rekomendasi utama deployment saat ini.
+  - Label operasional saat ini: `TESTED`, `RECOMMENDED`, `PRODUCTION CANDIDATE`.
+- Catatan battery:
+  - `WM_BATTERY_ENABLED=0` (default)
+  - Fitur battery tersedia di firmware, tetapi belum aktif secara default.
 
 ## Legacy / Diagnostic / Lab-only
 
@@ -347,4 +386,3 @@ Tidak ditemukan implementasi OTA firmware (`ArduinoOTA` / HTTP OTA update) di so
   - External flash spool manager + fallback runtime ke LittleFS.
   - Portable mode HTTP batch sync.
   - Battery feature compile-time gating (`WM_BATTERY_ENABLED`).
-
