@@ -1,0 +1,603 @@
+#include "external_flash_manager.h"
+
+#include <cstring>
+
+#include "pins.h"
+#include <FatLib/FatFormatter.h>
+
+namespace {
+String trimLine(String value) {
+  value.trim();
+  return value;
+}
+}  // namespace
+
+bool ExternalFlashManager::begin() {
+  telemetrySyncedOffset_ = 0;
+  eventSyncedOffset_ = 0;
+  portableTelemetrySyncedOffset_ = 0;
+  telemetryCache_.valid = false;
+  eventCache_.valid = false;
+  portableBatchCount_ = 0;
+
+  nvsReady_ = prefs_.begin(Config::NVS_NAMESPACE, false);
+  spiBus_.begin(Pins::EXT_FLASH_SCK, Pins::EXT_FLASH_MISO, Pins::EXT_FLASH_MOSI, Pins::EXT_FLASH_CS);
+
+  flashTransport_ = new Adafruit_FlashTransport_SPI(Pins::EXT_FLASH_CS, &spiBus_);
+  flash_ = new Adafruit_SPIFlash(flashTransport_);
+  if (flash_ == nullptr || !flash_->begin()) {
+    Serial.println("[EXTFLASH] init failed");
+    ready_ = false;
+    return false;
+  }
+
+  if (!fatfs_.begin(flash_)) {
+    if (!Config::EXT_FLASH_ALLOW_AUTO_FORMAT) {
+      Serial.println("[EXTFLASH] mount failed and auto-format disabled");
+      ready_ = false;
+      return false;
+    }
+
+    // Format only when explicitly allowed by config.
+    uint8_t workbuf[512];
+    FatFormatter formatter;
+    if (!formatter.format(flash_, workbuf, nullptr) || !fatfs_.begin(flash_)) {
+      Serial.println("[EXTFLASH] mount failed after format");
+      ready_ = false;
+      return false;
+    }
+    Serial.println("[EXTFLASH] formatted and mounted");
+  }
+
+  ready_ = ensureLayout() && loadState();
+  Serial.printf("[EXTFLASH] Init %s\n", ready_ ? "ok" : "fail");
+  return ready_;
+}
+
+bool ExternalFlashManager::isReady() const { return ready_; }
+
+bool ExternalFlashManager::appendTelemetry(const TelemetrySpoolRecord& record,
+                                           bool markSyncedIfContiguous) {
+  if (!ready_) {
+    return false;
+  }
+
+  telemetryCache_.valid = false;
+  String line = buildTelemetryLine(record);
+  return appendLine(Config::EXT_SPOOL_TELEMETRY_PATH, line, telemetrySyncedOffset_,
+                    Config::MAX_EXT_TELEMETRY_SPOOL_BYTES, markSyncedIfContiguous);
+}
+
+bool ExternalFlashManager::appendEvent(const EventSpoolRecord& record, bool markSyncedIfContiguous) {
+  if (!ready_) {
+    return false;
+  }
+
+  eventCache_.valid = false;
+  String line = buildEventLine(record);
+  return appendLine(Config::EXT_SPOOL_EVENTS_PATH, line, eventSyncedOffset_,
+                    Config::MAX_EXT_EVENTS_SPOOL_BYTES, markSyncedIfContiguous);
+}
+
+bool ExternalFlashManager::appendPortableTelemetry(const TelemetrySpoolRecord& record) {
+  if (!ready_) {
+    return false;
+  }
+
+  portableBatchCount_ = 0;
+  String line = buildTelemetryLine(record);
+  return appendLine(Config::EXT_SPOOL_PORTABLE_TELEMETRY_PATH, line, portableTelemetrySyncedOffset_,
+                    Config::MAX_EXT_PORTABLE_TELEMETRY_SPOOL_BYTES, false);
+}
+
+bool ExternalFlashManager::peekNextTelemetry(TelemetrySpoolRecord& record) {
+  if (!ready_) {
+    return false;
+  }
+
+  while (true) {
+    String line;
+    size_t nextOffset = 0;
+    if (!readNextLine(Config::EXT_SPOOL_TELEMETRY_PATH, telemetrySyncedOffset_, line, nextOffset)) {
+      telemetryCache_.valid = false;
+      return false;
+    }
+    if (line.length() == 0) {
+      if (nextOffset <= telemetrySyncedOffset_) {
+        telemetryCache_.valid = false;
+        return false;
+      }
+      telemetrySyncedOffset_ = nextOffset;
+      saveState();
+      continue;
+    }
+    if (!parseTelemetryLine(line, record)) {
+      telemetrySyncedOffset_ = nextOffset;
+      saveState();
+      telemetryCache_.valid = false;
+      return false;
+    }
+    telemetryCache_.valid = true;
+    telemetryCache_.nextOffset = nextOffset;
+    return true;
+  }
+}
+
+bool ExternalFlashManager::peekNextEvent(EventSpoolRecord& record) {
+  if (!ready_) {
+    return false;
+  }
+
+  while (true) {
+    String line;
+    size_t nextOffset = 0;
+    if (!readNextLine(Config::EXT_SPOOL_EVENTS_PATH, eventSyncedOffset_, line, nextOffset)) {
+      eventCache_.valid = false;
+      return false;
+    }
+    if (line.length() == 0) {
+      if (nextOffset <= eventSyncedOffset_) {
+        eventCache_.valid = false;
+        return false;
+      }
+      eventSyncedOffset_ = nextOffset;
+      saveState();
+      continue;
+    }
+    if (!parseEventLine(line, record)) {
+      eventSyncedOffset_ = nextOffset;
+      saveState();
+      eventCache_.valid = false;
+      return false;
+    }
+    eventCache_.valid = true;
+    eventCache_.nextOffset = nextOffset;
+    return true;
+  }
+}
+
+size_t ExternalFlashManager::loadPortableTelemetryBatch(TelemetrySpoolRecord* records,
+                                                        size_t maxRecords) {
+  if (!ready_ || records == nullptr || maxRecords == 0) {
+    portableBatchCount_ = 0;
+    return 0;
+  }
+
+  size_t limit = maxRecords;
+  if (limit > Config::MAX_PORTABLE_BATCH_SIZE) {
+    limit = Config::MAX_PORTABLE_BATCH_SIZE;
+  }
+
+  size_t cursor = portableTelemetrySyncedOffset_;
+  size_t loaded = 0;
+  while (loaded < limit) {
+    String line;
+    size_t nextOffset = 0;
+    if (!readNextLine(Config::EXT_SPOOL_PORTABLE_TELEMETRY_PATH, cursor, line, nextOffset)) {
+      break;
+    }
+    cursor = nextOffset;
+    if (line.length() == 0) {
+      continue;
+    }
+
+    TelemetrySpoolRecord parsed;
+    if (!parseTelemetryLine(line, parsed)) {
+      continue;
+    }
+
+    records[loaded] = parsed;
+    portableBatchOffsets_[loaded] = nextOffset;
+    loaded++;
+  }
+
+  portableBatchCount_ = loaded;
+  return loaded;
+}
+
+bool ExternalFlashManager::markTelemetrySynced() {
+  if (!ready_ || !telemetryCache_.valid) {
+    return false;
+  }
+  telemetrySyncedOffset_ = telemetryCache_.nextOffset;
+  telemetryCache_.valid = false;
+  return saveState();
+}
+
+bool ExternalFlashManager::markEventSynced() {
+  if (!ready_ || !eventCache_.valid) {
+    return false;
+  }
+  eventSyncedOffset_ = eventCache_.nextOffset;
+  eventCache_.valid = false;
+  return saveState();
+}
+
+bool ExternalFlashManager::markPortableTelemetryBatchSynced(size_t count) {
+  if (!ready_) {
+    return false;
+  }
+
+  if (count == 0) {
+    portableBatchCount_ = 0;
+    return true;
+  }
+  if (count > portableBatchCount_) {
+    return false;
+  }
+
+  portableTelemetrySyncedOffset_ = portableBatchOffsets_[count - 1];
+  portableBatchCount_ = 0;
+  return saveState();
+}
+
+bool ExternalFlashManager::hasPendingTelemetry() const {
+  return ready_ && telemetrySyncedOffset_ < fileSize(Config::EXT_SPOOL_TELEMETRY_PATH);
+}
+
+bool ExternalFlashManager::hasPendingEvents() const {
+  return ready_ && eventSyncedOffset_ < fileSize(Config::EXT_SPOOL_EVENTS_PATH);
+}
+
+bool ExternalFlashManager::hasPendingPortableTelemetry() const {
+  return ready_ && portableTelemetrySyncedOffset_ < fileSize(Config::EXT_SPOOL_PORTABLE_TELEMETRY_PATH);
+}
+
+size_t ExternalFlashManager::pendingTelemetryBytes() const {
+  size_t size = fileSize(Config::EXT_SPOOL_TELEMETRY_PATH);
+  return size > telemetrySyncedOffset_ ? size - telemetrySyncedOffset_ : 0;
+}
+
+size_t ExternalFlashManager::pendingEventBytes() const {
+  size_t size = fileSize(Config::EXT_SPOOL_EVENTS_PATH);
+  return size > eventSyncedOffset_ ? size - eventSyncedOffset_ : 0;
+}
+
+size_t ExternalFlashManager::pendingPortableTelemetryBytes() const {
+  size_t size = fileSize(Config::EXT_SPOOL_PORTABLE_TELEMETRY_PATH);
+  return size > portableTelemetrySyncedOffset_ ? size - portableTelemetrySyncedOffset_ : 0;
+}
+
+size_t ExternalFlashManager::pendingPortableTelemetryCount(size_t maxScanRecords) const {
+  if (!ready_ || maxScanRecords == 0) {
+    return 0;
+  }
+
+  auto file = fatfs_.open(Config::EXT_SPOOL_PORTABLE_TELEMETRY_PATH, O_RDONLY);
+  if (!file) {
+    return 0;
+  }
+  if (!file.seekSet(portableTelemetrySyncedOffset_)) {
+    file.close();
+    return 0;
+  }
+
+  size_t count = 0;
+  String line;
+  while (file.available() && count < maxScanRecords) {
+    int byteRead = file.read();
+    if (byteRead < 0) {
+      break;
+    }
+
+    char c = static_cast<char>(byteRead);
+    if (c == '\n') {
+      line = trimLine(line);
+      if (line.length() > 0) {
+        TelemetrySpoolRecord parsed;
+        if (parseTelemetryLine(line, parsed)) {
+          count++;
+        }
+      }
+      line = "";
+      continue;
+    }
+    line += c;
+  }
+
+  file.close();
+  return count;
+}
+
+bool ExternalFlashManager::ensureLayout() {
+  auto telemetry = fatfs_.open(Config::EXT_SPOOL_TELEMETRY_PATH, O_RDWR | O_CREAT | O_AT_END);
+  if (!telemetry) {
+    return false;
+  }
+  telemetry.close();
+
+  auto events = fatfs_.open(Config::EXT_SPOOL_EVENTS_PATH, O_RDWR | O_CREAT | O_AT_END);
+  if (!events) {
+    return false;
+  }
+  events.close();
+
+  auto portable =
+      fatfs_.open(Config::EXT_SPOOL_PORTABLE_TELEMETRY_PATH, O_RDWR | O_CREAT | O_AT_END);
+  if (!portable) {
+    return false;
+  }
+  portable.close();
+
+  return true;
+}
+
+bool ExternalFlashManager::loadState() {
+  telemetrySyncedOffset_ = 0;
+  eventSyncedOffset_ = 0;
+  portableTelemetrySyncedOffset_ = 0;
+
+  if (!nvsReady_) {
+    return true;
+  }
+
+  telemetrySyncedOffset_ = static_cast<size_t>(prefs_.getUInt("efs_toff", 0));
+  eventSyncedOffset_ = static_cast<size_t>(prefs_.getUInt("efs_eoff", 0));
+  portableTelemetrySyncedOffset_ = static_cast<size_t>(prefs_.getUInt("efs_poff", 0));
+
+  size_t telemetrySize = fileSize(Config::EXT_SPOOL_TELEMETRY_PATH);
+  size_t eventSize = fileSize(Config::EXT_SPOOL_EVENTS_PATH);
+  size_t portableSize = fileSize(Config::EXT_SPOOL_PORTABLE_TELEMETRY_PATH);
+
+  if (telemetrySyncedOffset_ > telemetrySize) {
+    telemetrySyncedOffset_ = telemetrySize;
+  }
+  if (eventSyncedOffset_ > eventSize) {
+    eventSyncedOffset_ = eventSize;
+  }
+  if (portableTelemetrySyncedOffset_ > portableSize) {
+    portableTelemetrySyncedOffset_ = portableSize;
+  }
+
+  return saveState();
+}
+
+bool ExternalFlashManager::saveState() {
+  if (!nvsReady_) {
+    return false;
+  }
+
+  prefs_.putUInt("efs_toff", static_cast<uint32_t>(telemetrySyncedOffset_));
+  prefs_.putUInt("efs_eoff", static_cast<uint32_t>(eventSyncedOffset_));
+  prefs_.putUInt("efs_poff", static_cast<uint32_t>(portableTelemetrySyncedOffset_));
+  return true;
+}
+
+size_t ExternalFlashManager::fileSize(const char* path) const {
+  auto file = fatfs_.open(path, O_RDONLY);
+  if (!file) {
+    return 0;
+  }
+
+  size_t size = static_cast<size_t>(file.size());
+  file.close();
+  return size;
+}
+
+bool ExternalFlashManager::appendLine(const char* path, const String& line, size_t& syncedOffset,
+                                      size_t maxBytes, bool markSyncedIfContiguous) {
+  if (!compactIfNeeded(path, syncedOffset, maxBytes)) {
+    return false;
+  }
+
+  size_t sizeBefore = fileSize(path);
+  auto file = fatfs_.open(path, O_RDWR | O_CREAT | O_AT_END);
+  if (!file) {
+    return false;
+  }
+  file.print(line);
+  file.print('\n');
+  size_t sizeAfter = static_cast<size_t>(file.size());
+  file.close();
+
+  if (markSyncedIfContiguous && syncedOffset >= sizeBefore) {
+    syncedOffset = sizeAfter;
+    if (!saveState()) {
+      return false;
+    }
+  }
+
+  return compactIfNeeded(path, syncedOffset, maxBytes);
+}
+
+bool ExternalFlashManager::readNextLine(const char* path, size_t syncedOffset, String& line,
+                                        size_t& nextOffset) const {
+  auto file = fatfs_.open(path, O_RDONLY);
+  if (!file) {
+    return false;
+  }
+  if (!file.seekSet(syncedOffset)) {
+    file.close();
+    return false;
+  }
+
+  size_t cursor = syncedOffset;
+  line = "";
+  while (file.available()) {
+    int byteRead = file.read();
+    if (byteRead < 0) {
+      break;
+    }
+    cursor++;
+    char c = static_cast<char>(byteRead);
+    if (c == '\n') {
+      break;
+    }
+    line += c;
+  }
+
+  line = trimLine(line);
+  nextOffset = cursor;
+  file.close();
+  return nextOffset > syncedOffset;
+}
+
+String ExternalFlashManager::buildTelemetryLine(const TelemetrySpoolRecord& record) const {
+  char buffer[48];
+  int written = snprintf(buffer, sizeof(buffer), "T,%lu,%lu,%d,%d,%d,%d",
+                         static_cast<unsigned long>(record.sequence),
+                         static_cast<unsigned long>(record.timestamp), record.temperatureX10,
+                         record.humidityX10, record.sampleOk ? 1 : 0, record.rtcOk ? 1 : 0);
+  if (written <= 0) {
+    return String();
+  }
+
+  String line;
+  line.reserve(static_cast<unsigned>(written));
+  line = buffer;
+  return line;
+}
+
+String ExternalFlashManager::buildEventLine(const EventSpoolRecord& record) const {
+  char buffer[64];
+  int written = snprintf(buffer, sizeof(buffer), "E,%lu,%lu,%s,%ld,%ld,%lu,%d,%d",
+                         static_cast<unsigned long>(record.sequence),
+                         static_cast<unsigned long>(record.timestamp), record.code,
+                         static_cast<long>(record.value), static_cast<long>(record.limit),
+                         static_cast<unsigned long>(record.duration), record.recovery ? 1 : 0,
+                         record.rtcOk ? 1 : 0);
+  if (written <= 0) {
+    return String();
+  }
+
+  String line;
+  line.reserve(static_cast<unsigned>(written));
+  line = buffer;
+  return line;
+}
+
+bool ExternalFlashManager::parseTelemetryLine(const String& line, TelemetrySpoolRecord& record) const {
+  char type = '\0';
+  unsigned long seq = 0;
+  unsigned long ts = 0;
+  int temp = 0;
+  int hum = 0;
+  int sampleOk = 0;
+  int rtcOk = 0;
+  int count = sscanf(line.c_str(), "%c,%lu,%lu,%d,%d,%d,%d", &type, &seq, &ts, &temp, &hum,
+                     &sampleOk, &rtcOk);
+  if (count != 7 || type != 'T') {
+    return false;
+  }
+
+  record.sequence = static_cast<uint32_t>(seq);
+  record.timestamp = static_cast<uint32_t>(ts);
+  record.temperatureX10 = static_cast<int16_t>(temp);
+  record.humidityX10 = static_cast<int16_t>(hum);
+  record.sampleOk = sampleOk != 0;
+  record.rtcOk = rtcOk != 0;
+  return true;
+}
+
+bool ExternalFlashManager::parseEventLine(const String& line, EventSpoolRecord& record) const {
+  char type = '\0';
+  unsigned long seq = 0;
+  unsigned long ts = 0;
+  char code[8] = {0};
+  long value = 0;
+  long limit = 0;
+  unsigned long duration = 0;
+  int recovery = 0;
+  int rtcOk = 0;
+  int count = sscanf(line.c_str(), "%c,%lu,%lu,%7[^,],%ld,%ld,%lu,%d,%d", &type, &seq, &ts, code,
+                     &value, &limit, &duration, &recovery, &rtcOk);
+  if (count != 9 || type != 'E') {
+    return false;
+  }
+
+  record.sequence = static_cast<uint32_t>(seq);
+  record.timestamp = static_cast<uint32_t>(ts);
+  strncpy(record.code, code, sizeof(record.code) - 1);
+  record.value = static_cast<int32_t>(value);
+  record.limit = static_cast<int32_t>(limit);
+  record.duration = static_cast<uint32_t>(duration);
+  record.recovery = recovery != 0;
+  record.rtcOk = rtcOk != 0;
+  return true;
+}
+
+bool ExternalFlashManager::compactIfNeeded(const char* path, size_t& syncedOffset, size_t maxBytes) {
+  size_t currentSize = fileSize(path);
+  if (currentSize <= maxBytes) {
+    return true;
+  }
+
+  if (syncedOffset > 0) {
+    if (!rewriteFromOffset(path, syncedOffset, syncedOffset)) {
+      return false;
+    }
+    syncedOffset = 0;
+    saveState();
+    currentSize = fileSize(path);
+    if (currentSize <= maxBytes) {
+      return true;
+    }
+  }
+
+  size_t keepFrom = currentSize > maxBytes ? currentSize - maxBytes : 0;
+  if (keepFrom > 0) {
+    auto source = fatfs_.open(path, O_RDONLY);
+    if (!source) {
+      return false;
+    }
+    if (!source.seekSet(keepFrom)) {
+      source.close();
+      return false;
+    }
+    if (keepFrom > 0) {
+      while (source.available()) {
+        int byteRead = source.read();
+        if (byteRead < 0) {
+          break;
+        }
+        if (static_cast<char>(byteRead) == '\n') {
+          break;
+        }
+      }
+      keepFrom = static_cast<size_t>(source.position());
+    }
+    source.close();
+  }
+
+  if (!rewriteFromOffset(path, syncedOffset, keepFrom)) {
+    return false;
+  }
+  syncedOffset = 0;
+  return saveState();
+}
+
+bool ExternalFlashManager::rewriteFromOffset(const char* path, size_t& syncedOffset,
+                                             size_t copyFromOffset) {
+  auto source = fatfs_.open(path, O_RDONLY);
+  if (!source) {
+    return false;
+  }
+  if (!source.seekSet(copyFromOffset)) {
+    source.close();
+    return false;
+  }
+
+  auto dest = fatfs_.open(Config::EXT_SPOOL_TEMP_PATH, O_RDWR | O_CREAT | O_TRUNC);
+  if (!dest) {
+    source.close();
+    return false;
+  }
+
+  while (source.available()) {
+    uint8_t buffer[128];
+    int readBytes = source.read(buffer, sizeof(buffer));
+    if (readBytes <= 0) {
+      break;
+    }
+    dest.write(buffer, static_cast<size_t>(readBytes));
+  }
+
+  source.close();
+  dest.close();
+  fatfs_.remove(path);
+  if (!fatfs_.rename(Config::EXT_SPOOL_TEMP_PATH, path)) {
+    syncedOffset = 0;
+    return false;
+  }
+  return true;
+}

@@ -1,0 +1,22 @@
+.pio/
+.pio-core/
+.piohome/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+.codex
+
+# Firmware build outputs
+*.bin
+*.elf
+*.map
+
+# Local secrets/config
+.env
+.env.*
+!.env.example
+secrets.h
+include/secrets.h
+include/certs.h
